@@ -17,3 +17,18 @@ Edit `INVERTER_DATA` and `USER_EMAIL` with appropriate values.
 source ./.venv/bin/activate
 sudo -E env PATH="$PATH" ./.venv/bin/python3 ./main.py
 ```
+
+
+# Environments
+
+## WSL 2
+This script won't work with the default WSL2 networking settings.
+
+Set
+
+```
+[wsl2]
+networkingMode=mirrored
+```
+
+On `%USERPROFILE%\.wslconfig`
