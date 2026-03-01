@@ -1,0 +1,14 @@
+FROM python:3.13-slim
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir requests protobuf grpcio-tools
+
+COPY tedapi.proto .
+RUN python -m grpc_tools.protoc --python_out=. --proto_path=. tedapi.proto
+
+COPY pvi_static_rules.py .
+COPY pvi_control_bearer.py .
+
+ENTRYPOINT ["python", "pvi_control_bearer.py"]
+CMD ["device-status"]
