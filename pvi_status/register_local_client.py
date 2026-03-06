@@ -238,8 +238,14 @@ def cmd_register(args):
                         print("** PRESENCE_PROOF — toggle breaker to verify! **")
                     else:
                         print(f"Verification type: {vtype}")
-                        print("Try toggling the breaker anyway, then run 'list' to check.")
-                        print("Or run: check-verify --host IP --password PWD  (polls every 5s)")
+                        print("HERMES_COMMAND: the device requires Tesla cloud to confirm.")
+                        print("\nNext steps:")
+                        print("  1. Try configure-remote to prompt the device to call home:")
+                        print("       python register_local_client.py --host HOST --password PWD \\")
+                        print("           configure-remote --email your@tesla-account.com")
+                        print("  2. Open the Tesla app while the inverter is cloud-connected.")
+                        print("  3. Poll for state changes:")
+                        print("       python register_local_client.py --host HOST --password PWD list")
             return
 
     if payload_type == 'common':
@@ -384,19 +390,20 @@ def cmd_register_trusted(args):
                             print("\n  ** PRESENCE_PROOF! Toggle breaker to verify! **")
                             print("  Leave key registered and toggle the inverter breaker.")
                             return
-                        # Remove for next strategy only if HERMES
-                        if strat != strategies[-1]:
-                            print("  Removing key to try next strategy...")
-                            rm_pb = tedapi_pb2.Message()
-                            rm_pb.message.deliveryChannel = tedapi_pb2.DELIVERY_CHANNEL_LOCAL_HTTPS
-                            rm_pb.message.sender.local = tedapi_pb2.LOCAL_PARTICIPANT_INSTALLER
-                            rm_pb.message.recipient.din = din
-                            rm_pb.message.authorization.removeAuthorizedClientRequest.publicKey = pub_der
-                            rm_pb.tail.value = 1
-                            try:
-                                _send_local_message(session, base, rm_pb)
-                            except Exception:
-                                pass
+                        # HERMES_COMMAND: key is registered, cloud verification needed.
+                        # From bundle analysis: only INSTALLER sender is accepted by the
+                        # device. Other strategies all error out. Stop here and keep the key.
+                        print(f"\n  Key is PENDING with HERMES_COMMAND verification.")
+                        print("  The device requires Tesla cloud to confirm this key.")
+                        print("\n  Next steps to try triggering cloud verification:")
+                        print("  1. Run configure-remote (may prompt device to call home):")
+                        print("       python register_local_client.py --host HOST --password PWD \\")
+                        print("           configure-remote --email your@tesla-account.com")
+                        print("  2. Open the Tesla app while the inverter is cloud-connected.")
+                        print("     Navigate to Energy > your site > Settings or Devices.")
+                        print("  3. After trying either, check status:")
+                        print("       python register_local_client.py --host HOST --password PWD list")
+                        return
                 continue
             print(f"  Unexpected auth message: {msg_type}")
         elif payload_type == 'common':
@@ -817,36 +824,100 @@ def cmd_list(args):
                 print()
 
 
-def cmd_remove(args):
-    """Remove a registered key."""
-    key_dir = get_key_dir(args.key_dir)
-    _, pub_der = load_rsa_key_pair(key_dir)
-
-    session, din, base = _make_local_session(args.host, args.password)
-    print(f"Gateway DIN: {din}\n")
-
+def _remove_key_bytes(session, base, din, pub_bytes):
+    """Send removeAuthorizedClientRequest for the given raw public key bytes."""
     pb = tedapi_pb2.Message()
     pb.message.deliveryChannel = tedapi_pb2.DELIVERY_CHANNEL_LOCAL_HTTPS
     pb.message.sender.local = tedapi_pb2.LOCAL_PARTICIPANT_INSTALLER
     pb.message.recipient.din = din
-    pb.message.authorization.removeAuthorizedClientRequest.publicKey = pub_der
+    pb.message.authorization.removeAuthorizedClientRequest.publicKey = pub_bytes
     pb.tail.value = 1
-
-    print(f"Removing key...")
     response = _send_local_message(session, base, pb)
-
     payload_type = response.message.WhichOneof('payload')
     if payload_type == 'authorization':
         msg_type = response.message.authorization.WhichOneof('message')
         if msg_type == 'removeAuthorizedClientResponse':
-            print("Removed!")
-            return
+            return True, None
     if payload_type == 'common':
         if response.message.common.WhichOneof('message') == 'errorResponse':
             error = response.message.common.errorResponse
-            print(f"Error (code {error.status.code}): {error.status.message}")
+            return False, f"code {error.status.code}: {error.status.message}"
+    return False, f"unexpected payload: {payload_type}"
+
+
+def cmd_remove(args):
+    """Remove a registered key.
+
+    Default: removes the RSA key loaded from --key-dir.
+    --pub-hex HEX: remove the key whose public key starts with HEX (from 'list' output).
+    --all: remove every key currently registered on the device.
+    """
+    session, din, base = _make_local_session(args.host, args.password)
+    print(f"Gateway DIN: {din}\n")
+
+    if args.all:
+        # Fetch all registered keys and remove each one
+        pb = tedapi_pb2.Message()
+        pb.message.deliveryChannel = tedapi_pb2.DELIVERY_CHANNEL_LOCAL_HTTPS
+        pb.message.sender.local = tedapi_pb2.LOCAL_PARTICIPANT_INSTALLER
+        pb.message.recipient.din = din
+        pb.message.authorization.listAuthorizedClientsRequest.CopyFrom(
+            tedapi_pb2.AuthorizationAPIListAuthorizedClientsRequest()
+        )
+        pb.tail.value = 1
+        resp = _send_local_message(session, base, pb)
+        clients = []
+        if resp.message.WhichOneof('payload') == 'authorization':
+            msg_type = resp.message.authorization.WhichOneof('message')
+            if msg_type == 'listAuthorizedClientsResponse':
+                clients = list(resp.message.authorization.listAuthorizedClientsResponse.clients)
+        if not clients:
+            print("No registered clients found.")
             return
-    print(f"Unexpected: {payload_type}")
+        print(f"Removing {len(clients)} key(s)...")
+        for c in clients:
+            preview = c.publicKey.hex()[:40]
+            ok, err = _remove_key_bytes(session, base, din, c.publicKey)
+            if ok:
+                print(f"  Removed: {preview}...")
+            else:
+                print(f"  Failed:  {preview}...  ({err})")
+        return
+
+    if args.pub_hex:
+        # Find and remove a key by hex prefix match
+        prefix = args.pub_hex.lower().replace(" ", "")
+        pb = tedapi_pb2.Message()
+        pb.message.deliveryChannel = tedapi_pb2.DELIVERY_CHANNEL_LOCAL_HTTPS
+        pb.message.sender.local = tedapi_pb2.LOCAL_PARTICIPANT_INSTALLER
+        pb.message.recipient.din = din
+        pb.message.authorization.listAuthorizedClientsRequest.CopyFrom(
+            tedapi_pb2.AuthorizationAPIListAuthorizedClientsRequest()
+        )
+        pb.tail.value = 1
+        resp = _send_local_message(session, base, pb)
+        match = None
+        if resp.message.WhichOneof('payload') == 'authorization':
+            msg_type = resp.message.authorization.WhichOneof('message')
+            if msg_type == 'listAuthorizedClientsResponse':
+                for c in resp.message.authorization.listAuthorizedClientsResponse.clients:
+                    if c.publicKey.hex().startswith(prefix):
+                        match = c.publicKey
+                        break
+        if match is None:
+            print(f"No key found with pub-hex prefix: {prefix}")
+            return
+        print(f"Removing key: {match.hex()[:40]}...")
+        ok, err = _remove_key_bytes(session, base, din, match)
+        print("Removed!" if ok else f"Failed: {err}")
+        return
+
+    # Default: remove the RSA key from disk
+    key_dir = get_key_dir(args.key_dir)
+    _, pub_der = load_rsa_key_pair(key_dir)
+    print(f"Removing RSA key from disk ({len(pub_der)} bytes)...")
+    ok, err = _remove_key_bytes(session, base, din, pub_der)
+    print("Removed!" if ok else f"Failed: {err}")
 
 
 # ============================================================
@@ -1664,7 +1735,11 @@ def main():
     sub_list.set_defaults(func=cmd_list)
 
     # remove
-    sub_rm = subs.add_parser("remove", help="Remove registered key")
+    sub_rm = subs.add_parser("remove", help="Remove registered key(s)")
+    sub_rm.add_argument("--all", action="store_true",
+                        help="Remove ALL keys registered on the device")
+    sub_rm.add_argument("--pub-hex", default=None, metavar="HEX",
+                        help="Remove key matching this hex prefix (from 'list' output)")
     sub_rm.set_defaults(func=cmd_remove)
 
     # tedapi-bearer (test TEDAPI with REST login Bearer token)
